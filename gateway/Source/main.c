@@ -41,6 +41,8 @@ typedef struct {
     bool                         radio_packet_received;
     gateway_packet_t             uart_packet;                           ///< Queue used to process received UART bytes outside of interrupt
     bool                         uart_packet_received;
+    gateway_packet_t             node_state_change_packet;              ///< Used to signal when a node joined or left
+    bool                         node_state_change_packet_pending;
     uint32_t                     buttons;                               ///< Buttons state (one byte per button)
     bool                         led1_mira;                             ///< Whether the status LED should mira
     bool                         client_connected;
@@ -48,7 +50,7 @@ typedef struct {
 
 //=========================== variables ========================================
 
-extern schedule_t schedule_minuscule, schedule_tiny, schedule_small, schedule_huge, schedule_only_beacons, schedule_only_beacons_optimized_scan;
+extern schedule_t schedule_minuscule, schedule_tiny, schedule_huge;
 static gateway_vars_t _gw_vars = { 0 };
 
 //=========================== callbacks ========================================
@@ -63,25 +65,37 @@ void mira_event_callback(mr_event_t event, mr_event_data_t event_data) {
     switch (event) {
         case MIRA_NEW_PACKET:
         {
-            memcpy(_gw_vars.radio_packet.buffer, event_data.data.new_packet.header, sizeof(mr_packet_header_t));
-            memcpy(_gw_vars.radio_packet.buffer + sizeof(mr_packet_header_t), event_data.data.new_packet.payload, event_data.data.new_packet.payload_len);
+            _gw_vars.radio_packet.buffer[0] = MIRA_EDGE_DATA;
+            memcpy(_gw_vars.radio_packet.buffer + 1, event_data.data.new_packet.header, sizeof(mr_packet_header_t));
+            memcpy(_gw_vars.radio_packet.buffer + 1 + sizeof(mr_packet_header_t), event_data.data.new_packet.payload, event_data.data.new_packet.payload_len);
             _gw_vars.radio_packet.length   = sizeof(mr_packet_header_t) + event_data.data.new_packet.payload_len;
             _gw_vars.radio_packet_received = true;
             break;
         }
+        case MIRA_KEEPALIVE:
+        {
+            _gw_vars.node_state_change_packet.buffer[0] = MIRA_EDGE_KEEPALIVE;
+            memcpy(_gw_vars.node_state_change_packet.buffer + 1, &event_data.data.node_info.node_id, sizeof(uint64_t));
+            _gw_vars.node_state_change_packet.length    = 1 + sizeof(uint64_t);
+            _gw_vars.node_state_change_packet_pending   = true;
+            break;
+        }
         case MIRA_NODE_JOINED:
-            printf("New node joined: %016llX\n", event_data.data.node_info.node_id);
-            uint64_t joined_nodes[MIRA_MAX_NODES] = { 0 };
-            uint8_t joined_nodes_len = mira_gateway_get_nodes(joined_nodes);
-            printf("Number of connected nodes: %d\n", joined_nodes_len);
-            // TODO: send list of joined_nodes to Edge Gateway via UART
+            puts("#");
+            _gw_vars.node_state_change_packet.buffer[0] = MIRA_EDGE_NODE_JOINED;
+            memcpy(_gw_vars.node_state_change_packet.buffer + 1, &event_data.data.node_info.node_id, sizeof(uint64_t));
+            _gw_vars.node_state_change_packet.length = 1 + sizeof(uint64_t);
+            _gw_vars.node_state_change_packet_pending = true;
             break;
         case MIRA_NODE_LEFT:
-            printf("Node left: %016llX, reason: %u\n", event_data.data.node_info.node_id, event_data.tag);
-            printf("Number of connected nodes: %d\n", mira_gateway_count_nodes());
+            puts("0");
+            _gw_vars.node_state_change_packet.buffer[0] = MIRA_EDGE_NODE_LEFT;
+            memcpy(_gw_vars.node_state_change_packet.buffer + 1, &event_data.data.node_info.node_id, sizeof(uint64_t));
+            _gw_vars.node_state_change_packet.length = 1 + sizeof(uint64_t);
+            _gw_vars.node_state_change_packet_pending = true;
             break;
         case MIRA_ERROR:
-            printf("Error\n");
+            puts("Error");
             break;
         default:
             break;
@@ -135,13 +149,15 @@ int main(void) {
 
     while (1) {
 
+        if (_gw_vars.node_state_change_packet_pending) {
+            if (_gw_vars.client_connected) {
+                swarmit_uart_write(UART_INDEX, _gw_vars.node_state_change_packet.buffer, _gw_vars.node_state_change_packet.length);
+            }
+            _gw_vars.node_state_change_packet_pending = false;
+        }
+
         if (_gw_vars.radio_packet_received) {
             db_gpio_clear(&db_led2);
-            printf("Radio packet received (%d B): payload=", _gw_vars.radio_packet.length);
-            for (int i = 0; i < _gw_vars.radio_packet.length; i++) {
-                printf("%02X ", _gw_vars.radio_packet.buffer[i]);
-            }
-            printf("\n");
             if (_gw_vars.client_connected) {
                 swarmit_uart_write(UART_INDEX, _gw_vars.radio_packet.buffer, _gw_vars.radio_packet.length);
             }
@@ -153,21 +169,21 @@ int main(void) {
             if (!_gw_vars.client_connected && _gw_vars.uart_packet.buffer[0] == 0xff) {
                 _gw_vars.client_connected = true;
                 puts("UART client connected");
-            } else if (_gw_vars.client_connected && _gw_vars.uart_packet.buffer[0] == 0xfe) {
+
+                gateway_packet_t packet = { 0 };
+                packet.buffer[0] = MIRA_EDGE_GATEWAY_INFO;
+                size_t len = mr_build_uart_packet_gateway_info(packet.buffer + 1);
+                packet.length = 1 + len;
+                swarmit_uart_write(UART_INDEX, packet.buffer, packet.length);
+            } else if (_gw_vars.uart_packet.buffer[0] == 0xfe) {
                 _gw_vars.client_connected = false;
                 puts("UART client disconnected");
             } else {
                 mr_packet_header_t *header = (mr_packet_header_t *)_gw_vars.uart_packet.buffer;
-                header->dst = MIRA_BROADCAST_ADDRESS;
                 header->src = db_device_id();
                 header->version = MIRA_PROTOCOL_VERSION;
                 header->type = MIRA_PACKET_DATA;
                 memcpy(_gw_vars.uart_packet.buffer, header, sizeof(mr_packet_header_t));
-                printf("UART packet received (%d B): payload=", _gw_vars.uart_packet.length);
-                for (size_t i = 0; i < _gw_vars.uart_packet.length; i++) {
-                    printf("%02X ", _gw_vars.uart_packet.buffer[i]);
-                }
-                printf("\n");
                 mira_tx(_gw_vars.uart_packet.buffer, _gw_vars.uart_packet.length);
             }
             _gw_vars.uart_packet_received = false;
